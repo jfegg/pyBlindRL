@@ -55,14 +55,14 @@ def emplace_center(img, img2, dtype=np.complex128):
     return out
 
 
-def generate_initial_psf(img):
+def generate_initial_psf(img, psf_shape = (64, 64, 64)):
     """
     Creates a PSF image based on a Gaussian centered on the corners
 
     Parameters:
         img (3d numpy array): Image to use as a template
     """
-    psf_shape = (64, 64, 64)
+
     psf = gaussian_3d(psf_shape, sigma=(1, 1, 2))
 
     out = emplace_center(img, psf)
@@ -75,10 +75,14 @@ def generate_initial_psf(img):
 def generate_initial_psf_smaller(img, psf_shape):
     psf = gaussian_3d(psf_shape, sigma=(1, 1, 2))
 
+    print(psf)
+
     out = emplace_center(img, psf)
     out += 1
 
     out = roll_psf(out)
+
+    print(out)
 
     return out
 
@@ -302,8 +306,6 @@ def RL_deconv_blind(gt_image, out_image, psf, iterations=20, rl_iter=10, eps=1e-
         reg_factor (float): value used to regularize the image
         target_device (str): name of pytorch device to use for calculation
     """
-
-    start_memory = torch.cuda.memory_allocated(target_device)
 
     with torch.no_grad():
         tmp_image = gt_image.to(target_device)

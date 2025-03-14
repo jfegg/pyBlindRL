@@ -1,27 +1,57 @@
 from commands import *
-from utility import clear_dir
 import skimage.metrics
 import time
 import tifffile as tiff
 import torch
-from cloudvolume import CloudVolume
+# from cloudvolume import CloudVolume
 from tqdm import tqdm
 import numpy as np
 import os
 import shutil
 import matplotlib.pyplot as plt
 
-# XY Tiled Deconvolution of the entire image
-# x, y, z coordinates of image in larger image volume
-# xy_size is the size of the entire chunk of the image
-# slices is the z size of the entire image
-# section size is the tile size for the current image !!!(currently hard coded to be 100 need to change)
-# blind iterations = blind training of the psf
-# normal iterations = deconvolution with the psf learned from the blinded deconvolution
-# device = cuda device
-# output_dir = where all output images will be saved
+def deconv_with_psf(img, psf_estimate, normal_iterations, device, output_dir):
+    """
+    Print the output image
 
-def xy_tiled_image_deconvolution(x, y, z, xy_size, slices, section_size, blind_iterations, normal_iterations, device, output_dir):
+    Parameters:
+
+    """
+
+    psf_estimate = psf_estimate.astype(np.complex128)
+
+    output_psf = psf_estimate.copy()
+
+    tiff.imwrite(output_dir + "/initial_psf.tiff", output_psf.astype(np.uint16))
+
+    intermediate = torch.from_numpy(img.astype(np.complex128))
+    deconvoluted = torch.from_numpy(img.astype(np.complex128))
+
+    deconvoluted, _ = RL_deconv(torch.from_numpy(img.astype(np.complex128)), intermediate, torch.from_numpy(psf_estimate).type(torch.cdouble), iterations = normal_iterations, target_device=device)
+
+    psf_estimate = unroll_psf(psf_estimate)
+
+    tiff.imwrite(output_dir + "/result" + ".tiff", deconvoluted.astype(np.uint16))
+
+
+
+def xy_tiled_image_deconvolution(x, y, z, xy_size, slices, section_size, overlap, blind_iterations, normal_iterations, device, output_dir, trial_name):
+    """
+    Perform XY Tiled Deconvolution of image with blending
+    The outer edge tiles will not be inlucded in the output image
+
+    Parameters:
+        x, y, z (int): position upper-left corner of frame on whole image
+        xy_size (int): width and height of input image
+        slices (int): z depth of image
+        section_size (int): size of tiles to calculate on
+        overlap (int): amount of pixel overlapping on the edges of tiles for blending
+        blind iterations (int): number of blinded iterations to train PSF
+        normal iterations (int): number of unblinded iterations performed on each tile
+        device (torch device): device tiles are sent to for deconvolution
+        output_dir (str): filepath to create trial dir in
+        trial_name (str): name of trial
+    """
 
     start_time = time.time()
 
@@ -34,15 +64,13 @@ def xy_tiled_image_deconvolution(x, y, z, xy_size, slices, section_size, blind_i
 
     img = img.transpose(2, 0, 1)
 
-    deconv_dir = output_dir + "/deconv"
-    deconv_avg_dir = output_dir + "/deconv_avg"
-    output_functions_dir = output_dir + "/functions"
-    imgs_dir = output_dir + "/imgs"
+    deconv_dir = output_dir + "/" + trial_name +  "/deconv"
+    imgs_dir = output_dir + "/" + trial_name + "/imgs"
 
-    dirs = [deconv_dir, output_functions_dir, imgs_dir, deconv_avg_dir]
-
-    for i in dirs:
-        clear_dir(i)
+    if not os.path.isdir(output_dir + "/" + trial_name):
+        os.mkdir(output_dir + "/" + trial_name)
+        os.mkdir(deconv_dir)
+        os.mkdir(imgs_dir)
 
     img_tensor = torch.from_numpy(np.array(img).astype(np.int16))
     psf_guess = np.zeros(np.array(img).shape, dtype=np.complex128)
@@ -73,10 +101,6 @@ def xy_tiled_image_deconvolution(x, y, z, xy_size, slices, section_size, blind_i
     print("Blinded Time")
     print(psf_time - setup_time)
 
-
-    psf_average = np.zeros((slices, section_size, section_size))
-
-
     # Calculate an average PSF from those generated across the entire image
     psf_average = np.zeros((slices, section_size, section_size), dtype=np.complex128)
 
@@ -88,43 +112,31 @@ def xy_tiled_image_deconvolution(x, y, z, xy_size, slices, section_size, blind_i
 
 
     psf_average = unroll_psf(psf_average)
-    tiff.imwrite(output_functions_dir + "/img_" + str((1)) + ".tiff", clip_psf(psf_average).astype(np.uint16))
+    tiff.imwrite(imgs_dir + "/psf_" + str((1)) + ".tiff", clip_psf(psf_average).astype(np.uint16))
 
     # Use a larger tile size for the middle of the image
-    # Use the smaller tile edges of the image
-    # TODO All of the tile sizes are hard coded
-    psf_average_small = np.copy(psf_average)
-    psf_average_large = np.zeros((slices, 150, 150))
+    large_size = section_size + overlap * 2
 
-    if section_size > 150:
-        psf_average_large = clip_psf(psf_average, (64, 150, 150))
-        psf_average_small = clip_psf(psf_average, (64, 100, 100))
-    else:
-        psf_average_large = emplace_center(psf_average_large, psf_average)
-
-    psf_average_small = roll_psf(psf_average_small)
+    psf_average_large = np.zeros((slices, large_size, large_size))
+    psf_average_large = emplace_center(psf_average_large, psf_average)
     psf_average_large = roll_psf(psf_average_large)
 
-    average_output = np.zeros((12, 12, 64, 150, 150))
 
+    average_output = np.zeros((xy_size / section_size,  xy_size/ section_size, slices, large_size, large_size))
     intermediate_output = torch.clone(img_tensor)
 
-    section_size = 100
-    overlap = 25
-
     #Deconvolve with the average psf for about as many iterations as the normal image has had itself
-
+    last_tile_idx = (xy_size / section_size) - 1
     for i in range(int(xy_size / section_size)):
         for j in range(int(xy_size / section_size)):
 
-            # TODO This training size is also hard coded here
-            # If it is in the middle of the image then
-            if i > 0 and i < 11 and j > 0 and j < 11:
+            # If it is in the middle of the image then calculate the deconvolution
+            if i > 0 and i < last_tile_idx and j > 0 and j < last_tile_idx:
                 output_piece, mem = RL_deconv(img_tensor[:, (i*section_size) - overlap:((i+1) * section_size) + overlap, (j*section_size) - overlap :((j+1) * section_size) + overlap], intermediate_output[:, (i*section_size) - overlap :((i+1) * section_size) + overlap, (j*section_size) - overlap :((j+1) * section_size) + overlap].type(torch.cdouble), torch.from_numpy(psf_average_large).type(torch.cdouble), iterations = normal_iterations, target_device=device)
 
                 average_output[i, j, :, :, :] = output_piece
 
-    average_output = torch.from_numpy(edge_correction(average_output, 150, 100, (64, 1200, 1200)))
+    average_output = torch.from_numpy(edge_correction(average_output, large_size, section_size, (slices, xy_size, xy_size)))
 
     normal_deconv_time = time.time()
     print("Normal Deconvolution Time")
@@ -134,13 +146,26 @@ def xy_tiled_image_deconvolution(x, y, z, xy_size, slices, section_size, blind_i
     psnr = skimage.metrics.peak_signal_noise_ratio(img_tensor[:, 100:1100, 100:1100].numpy().astype(np.uint16), intensity_match_image(img_tensor[:, 100:1100, 100:1100].numpy().astype(np.uint16), average_output[:, 100:1100, 100:1100].numpy().astype(np.uint16)))
     print(psnr)
 
-    tiff.imwrite(deconv_avg_dir + "/img_" + str((1)) + ".tiff", average_output.numpy().astype(np.uint16))
-
-device = torch.device("cuda", 0)
-# xy_tiled_image_deconvolution(6900, 9900, 493, 1200, 64, 100, 50, 1000, device, "/mnt/turbo/jfeggerd/outputs_rolling_edge")
+    tiff.imwrite(deconv_dir + "/img_" + str((1)) + ".tiff", average_output.numpy().astype(np.uint16))
 
 
 def z_tiled_image_deconvolution(x, y, z, xy_size, slices, section_size, blind_iterations, normal_iterations, device, output_dir, trial_name, log):
+    """
+    Perform Z Tiled Deconvolution of image
+    Deconvolve the image in stacks in the Z dimension
+
+    Parameters:
+        x, y, z (int): position upper-left corner of frame on whole image
+        xy_size (int): width and height of input image
+        slices (int): z depth of image
+        section_size (int): size of tiles to calculate on
+        blind iterations (int): number of blinded iterations to train PSF
+        normal iterations (int): number of unblinded iterations performed on each tile
+        device (torch device): device tiles are sent to for deconvolution
+        output_dir (str): filepath to create trial dir in
+        trial_name (str): name of trial
+        log (bool): save many images during training to log the progression of deconvolution (much much slower)
+    """
 
     start_time = time.time()
 
@@ -247,13 +272,24 @@ def z_tiled_image_deconvolution(x, y, z, xy_size, slices, section_size, blind_it
     plt.close()
 
 
-device = torch.device("cuda", 0)
-
-# z_tiled_image_deconvolution(11000, 12000, 493, 2000, 100, 50, 25, 100, device, "/mnt/turbo/jfeggerd/outputs_z_tiled", "trial_15", False)
-
-
-
 def h5_input_deconv(section_size, blind_iterations, normal_iterations, device, output_dir, trial_name, log):
+    """
+    Perform Z Tiled Deconvolution of image that is an h5 input file instead of cloud volume
+    Deconvolve the image in stacks in the Z dimension
+
+    Parameters:
+        x, y, z (int): position upper-left corner of frame on whole image
+        xy_size (int): width and height of input image
+        slices (int): z depth of image
+        section_size (int): size of tiles to calculate on
+        blind iterations (int): number of blinded iterations to train PSF
+        normal iterations (int): number of unblinded iterations performed on each tile
+        device (torch device): device tiles are sent to for deconvolution
+        output_dir (str): filepath to create trial dir in
+        trial_name (str): name of trial
+        log (bool): save many images during training to log the progression of deconvolution (much much slower)
+    """
+
     import h5py
 
     start_time = time.time()
@@ -354,5 +390,3 @@ def h5_input_deconv(section_size, blind_iterations, normal_iterations, device, o
     plt.xlabel("Normal Deconvolution Iterations")
     plt.savefig(output_dir + "/" + trial_name + "/psnr.png")
     plt.close()
-
-h5_input_deconv(40, 1, 100, device, "/mnt/turbo/jfeggerd/outputs_z_tiled", "trial_21", True)
